@@ -13,16 +13,18 @@ from googleapiclient.errors import HttpError
 from nba_api.stats.endpoints import leaguegamefinder, boxscoretraditionalv3
 from nba_api.stats.static import teams
 
-from consts import channels, players_to_watch
+from consts import channels, players_to_watch, NBA_channel, crunch_time_playlist
 
 
 class NbaEmail:
-    def __init__(self):
+    def __init__(self, today = None):
         load_dotenv()
         self.api_key = os.getenv("API_KEY")
         self.email_address = os.getenv("EMAIL_ADDRESS")
         self.email_password = os.getenv("EMAIL_PASSWORD")
-        self.yesterday = datetime.datetime.now() - datetime.timedelta(days=1)
+        self.youtube = build("youtube", "v3", developerKey=self.api_key)
+        self.today = today or datetime.datetime.now(datetime.UTC)
+        self.yesterday = self.today - datetime.timedelta(days=1)
         self.team_nicknames = {team["nickname"] for team in teams.get_teams()}
 
         self.game_finder = leaguegamefinder.LeagueGameFinder(
@@ -45,11 +47,10 @@ class NbaEmail:
 
     def get_channel_id(self, username):
         """Fetch the channel ID from the username."""
-        youtube = build("youtube", "v3", developerKey=self.api_key)
 
         try:
             response = (
-                youtube.channels()
+                self.youtube.channels()
                 .list(
                     part="id",
                     forHandle=username,  # Use "forHandle" for @usernames
@@ -66,20 +67,16 @@ class NbaEmail:
             return None
 
     def search_video_in_channel(
-        self, channel_username, search_terms, exclude_highlights=False
-    ):
+        self, channel_username, search_terms):
         """Search for a video in a specific channel, ensuring all search terms appear in the title, and it was posted in the last 5 days.
-        Optionally exclude videos with 'FULL GAME HIGHLIGHTS' in the title if exclude_highlights is True.
         """
         channel_id = self.get_channel_id(channel_username)
         if not channel_id:
             return None  # If the channel ID isn't found, return None
 
-        youtube = build("youtube", "v3", developerKey=self.api_key)
-
         try:
             search_response = (
-                youtube.search()
+                self.youtube.search()
                 .list(
                     part="snippet",
                     channelId=channel_id,
@@ -94,9 +91,7 @@ class NbaEmail:
                 terms = set(
                     search_terms.lower().split()
                 )  # Convert search terms into a set of words
-                five_days_ago = datetime.datetime.now(
-                    datetime.UTC
-                ) - datetime.timedelta(days=5)
+                five_days_ago = self.today - datetime.timedelta(days=5)
 
                 for item in search_response["items"]:
                     title = item["snippet"]["title"]
@@ -104,9 +99,6 @@ class NbaEmail:
                     published_at = datetime.datetime.strptime(
                         item["snippet"]["publishedAt"], "%Y-%m-%dT%H:%M:%SZ"
                     ).replace(tzinfo=datetime.UTC)
-
-                    if exclude_highlights and "HIGHLIGHTS".lower() in title.lower():
-                        continue  # Skip videos with "FULL GAME HIGHLIGHTS" in the title if flag is enabled
 
                     if (
                         all(term in title.lower() for term in terms)
@@ -122,27 +114,96 @@ class NbaEmail:
             print(f"API error while searching in {channel_username}: {e}")
             return None
 
-    def search_video(self, search_terms):
-        """Search in multiple channels sequentially, then return a YouTube search URL if no results."""
-        highlight_video = (
-            self.search_video_in_channel(
-                "@NBA", self.filter_key_terms(search_terms), exclude_highlights=True
+
+    def crunch_time_highlights(
+            self,
+            matchup,
+            channel_username = NBA_channel,
+            playlist_name = crunch_time_playlist
+    ):
+        """
+        Search for a recent video (last 5 days) inside a specific playlist
+        belonging to a channel. All search terms must appear in the title.
+        """
+
+        channel_id = self.get_channel_id(channel_username)
+        if not channel_id:
+            return None
+
+
+
+        playlist_id = self.get_playlist_id_by_name(channel_id, playlist_name)
+        if not playlist_id:
+            return None
+        cities_matchup = set(self.get_full_team_matchup(matchup, nicknames=False).lower().split())
+        nicknames_matchup = set(self.get_full_team_matchup(matchup, cities=False).lower().split())
+        five_days_ago = self.today - datetime.timedelta(days=5)
+
+        try:
+            request = self.youtube.playlistItems().list(
+                part="snippet",
+                playlistId=playlist_id,
+                maxResults=7,
             )
-            or ""
-        )
+
+            while request:
+                response = request.execute()
+
+                for item in response.get("items", []):
+                    snippet = item["snippet"]
+
+                    # Skip removed / private / foreign-channel videos
+                    if snippet.get("videoOwnerChannelId") != channel_id:
+                        continue
+
+                    title = snippet["title"]
+
+                    published_at = datetime.datetime.strptime(
+                        snippet["publishedAt"], "%Y-%m-%dT%H:%M:%SZ"
+                    ).replace(tzinfo=datetime.UTC)
+
+                    if published_at < five_days_ago:
+                        continue
+
+                    if all(term in title.lower() for term in cities_matchup) or all(term in title.lower() for term in nicknames_matchup):
+                        video_id = snippet["resourceId"]["videoId"]
+                        channel_name = snippet["channelTitle"]
+
+                        return (
+                            f"{channel_name} - {title} - "
+                            f"https://www.youtube.com/watch?v={video_id}"
+                        )
+
+                request = self.youtube.playlistItems().list_next(request, response)
+
+            return None
+
+        except HttpError as e:
+            print(f"API error while searching playlist '{playlist_name}': {e}")
+            return None
+
+    def get_highlights(self, matchup_name):
+        """Search in multiple channels sequentially, then return a YouTube search URL if no results."""
+
+
+        game_highlights = self.crunch_time_highlights(matchup_name) or ""
+
+        expanded_search_terms = f"{self.get_full_team_matchup(matchup_name)} {self.yesterday.strftime('%b %d %Y').replace(' 0', ' ')}"
 
         # Try searching in each channel in order
         for channel in channels:
-            result = self.search_video_in_channel(channel, search_terms)
+            result = self.search_video_in_channel(channel, expanded_search_terms)
             if result:
-                highlight_video += "\n" + result
-                return highlight_video
+                game_highlights += "\n" + result
+                return game_highlights
 
-        encoded_query = urllib.parse.quote(search_terms)
-        highlight_video += (
+
+        # If no video found, return search link
+        encoded_query = urllib.parse.quote(expanded_search_terms)
+        game_highlights += (
             "\n" + f"https://www.youtube.com/results?search_query={encoded_query}"
         )
-        return highlight_video
+        return game_highlights
 
     @staticmethod
     def youtube_search_url(query):
@@ -151,13 +212,36 @@ class NbaEmail:
         return f"{base_url}?{urllib.parse.urlencode(params)}"
 
     @staticmethod
-    def get_full_team_matchup(abbreviated_matchup):
+    def get_full_team_matchup(abbreviated_matchup, cities = True, nicknames = True):
         abbrevs = abbreviated_matchup.split(" @ ")
         fulls = []
         for team in teams.get_teams():
             if team["abbreviation"] in abbrevs:
-                fulls.append(team["full_name"])
+                if cities:
+                    fulls.append(team["city"])
+                if nicknames:
+                    fulls.append(team["nickname"])
         return " ".join(fulls)
+
+
+    def get_playlist_id_by_name(self, channel_id, playlist_name):
+
+        request = self.youtube.playlists().list(
+            part="snippet",
+            channelId=channel_id,
+            maxResults=50,
+        )
+
+        while request:
+            response = request.execute()
+
+            for item in response.get("items", []):
+                if item["snippet"]["title"].lower() == playlist_name.lower():
+                    return item["id"]
+
+            request = self.youtube.playlists().list_next(request, response)
+
+        return None
 
     def filter_key_terms(self, input_string):
         words = input_string.split()
@@ -243,21 +327,16 @@ class NbaEmail:
         for game in self.games:
             # For example:
             matchup_name = game[self.matchup_header_idx["MATCHUP"]]
-            expanded_matchup_name = self.get_full_team_matchup(matchup_name)
             game_id = game[self.matchup_header_idx["GAME_ID"]]
             # {"NYK @ TOR": 1627673}
             game_ids[matchup_name] = game_id
             if "NYK" in matchup_name:
                 knicks_game += f"\n\nKnicks Played Last Night! {matchup_name}\n"
-                knicks_game += self.search_video(
-                    f"{expanded_matchup_name} {self.yesterday.strftime('%b %d %Y').replace(' 0', ' ')}"
-                )
+                knicks_game += self.get_highlights(matchup_name)
 
             elif abs(game[self.matchup_header_idx["PLUS_MINUS"]]) < 11.0:
                 close_games += f"\n\nClose game! {matchup_name}\n"
-                close_games += self.search_video(
-                    f"{expanded_matchup_name} {self.yesterday.strftime('%b %d %Y').replace(' 0', ' ')}"
-                )
+                close_games += self.get_highlights(matchup_name)
 
             else:
                 blowouts += "\n\n" + matchup_name + "\n"
@@ -307,5 +386,6 @@ class NbaEmail:
 
 
 if __name__ == "__main__":
-    nba = NbaEmail()
+    x = datetime.datetime.now(datetime.UTC) # - datetime.timedelta(days=4)
+    nba = NbaEmail(x)
     nba.run()
