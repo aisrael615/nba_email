@@ -6,6 +6,8 @@ import smtplib
 import urllib
 import urllib.parse
 from email.mime.text import MIMEText
+from functools import cached_property
+from typing import List, Optional
 
 from dotenv import load_dotenv
 from googleapiclient.discovery import build
@@ -115,6 +117,80 @@ class NbaEmail:
             return None
 
 
+    @cached_property
+    def crunch_time_playlist_items(self) -> List[dict]:
+        """
+        Cached (per-instance) list of recent Crunch Time playlist items.
+
+        Fetched from YouTube the first time it is accessed, then reused for the
+        rest of the run so multiple close games don't trigger extra API calls.
+        """
+        channel_id = self.get_channel_id(NBA_channel)
+        if not channel_id:
+            return []
+
+        playlist_id = self.get_playlist_id_by_name(channel_id, crunch_time_playlist)
+        if not playlist_id:
+            return []
+
+        five_days_ago = self.today - datetime.timedelta(days=5)
+        items: List[dict] = []
+
+        try:
+            request = self.youtube.playlistItems().list(
+                part="snippet",
+                playlistId=playlist_id,
+                maxResults=50,
+            )
+
+            while request:
+                response = request.execute()
+
+                for item in response.get("items", []):
+                    snippet = item.get("snippet") or {}
+
+                    # Skip removed / private / foreign-channel videos
+                    if snippet.get("videoOwnerChannelId") != channel_id:
+                        continue
+
+                    published_at_str = snippet.get("publishedAt")
+                    if not published_at_str:
+                        continue
+
+                    try:
+                        published_at = datetime.datetime.strptime(
+                            published_at_str, "%Y-%m-%dT%H:%M:%SZ"
+                        ).replace(tzinfo=datetime.UTC)
+                    except ValueError:
+                        continue
+
+                    if published_at < five_days_ago:
+                        continue
+
+                    resource = snippet.get("resourceId") or {}
+                    video_id = resource.get("videoId")
+                    title = snippet.get("title")
+                    channel_title = snippet.get("channelTitle")
+                    if not (video_id and title and channel_title):
+                        continue
+
+                    items.append(
+                        {
+                            "title": title,
+                            "publishedAt": published_at_str,
+                            "videoId": video_id,
+                            "channelTitle": channel_title,
+                        }
+                    )
+
+                request = self.youtube.playlistItems().list_next(request, response)
+
+        except HttpError as e:
+            print(f"API error while fetching playlist '{crunch_time_playlist}': {e}")
+            items = []
+
+        return items
+
     def crunch_time_highlights(
             self,
             matchup,
@@ -123,64 +199,26 @@ class NbaEmail:
     ):
         """
         Search for a recent video (last 5 days) inside a specific playlist
-        belonging to a channel. All search terms must appear in the title.
+        belonging to a channel. Uses a cached playlist fetch to avoid repeated API calls.
         """
-
-        channel_id = self.get_channel_id(channel_username)
-        if not channel_id:
-            return None
-
-
-
-        playlist_id = self.get_playlist_id_by_name(channel_id, playlist_name)
-        if not playlist_id:
-            return None
+        # We currently cache only the default NBA Crunch Time playlist; if a different
+        # channel/playlist is requested, fall back to a one-off fetch in the future.
         cities_matchup = set(self.get_full_team_matchup(matchup, nicknames=False).lower().split())
         nicknames_matchup = set(self.get_full_team_matchup(matchup, cities=False).lower().split())
-        five_days_ago = self.today - datetime.timedelta(days=5)
 
-        try:
-            request = self.youtube.playlistItems().list(
-                part="snippet",
-                playlistId=playlist_id,
-                maxResults=7,
-            )
+        for item in self.crunch_time_playlist_items:
+            title = item["title"]
+            if all(term in title.lower() for term in cities_matchup) or all(
+                term in title.lower() for term in nicknames_matchup
+            ):
+                video_id = item["videoId"]
+                channel_name = item["channelTitle"]
+                return (
+                    f"{channel_name} - {title} - "
+                    f"https://www.youtube.com/watch?v={video_id}"
+                )
 
-            while request:
-                response = request.execute()
-
-                for item in response.get("items", []):
-                    snippet = item["snippet"]
-
-                    # Skip removed / private / foreign-channel videos
-                    if snippet.get("videoOwnerChannelId") != channel_id:
-                        continue
-
-                    title = snippet["title"]
-
-                    published_at = datetime.datetime.strptime(
-                        snippet["publishedAt"], "%Y-%m-%dT%H:%M:%SZ"
-                    ).replace(tzinfo=datetime.UTC)
-
-                    if published_at < five_days_ago:
-                        continue
-
-                    if all(term in title.lower() for term in cities_matchup) or all(term in title.lower() for term in nicknames_matchup):
-                        video_id = snippet["resourceId"]["videoId"]
-                        channel_name = snippet["channelTitle"]
-
-                        return (
-                            f"{channel_name} - {title} - "
-                            f"https://www.youtube.com/watch?v={video_id}"
-                        )
-
-                request = self.youtube.playlistItems().list_next(request, response)
-
-            return None
-
-        except HttpError as e:
-            print(f"API error while searching playlist '{playlist_name}': {e}")
-            return None
+        return None
 
     def get_highlights(self, matchup_name):
         """Search in multiple channels sequentially, then return a YouTube search URL if no results."""
@@ -225,7 +263,6 @@ class NbaEmail:
 
 
     def get_playlist_id_by_name(self, channel_id, playlist_name):
-
         request = self.youtube.playlists().list(
             part="snippet",
             channelId=channel_id,
@@ -315,7 +352,16 @@ class NbaEmail:
             server.login(self.email_address, self.email_password)
             server.sendmail(self.email_address, self.email_address, msg.as_string())
 
-        print(email_string)
+        # Printing can fail on Windows consoles when the body contains emojis or
+        # other characters not supported by the current code page. Fall back to
+        # a lossy ASCII-safe representation instead of crashing.
+        try:
+            print(email_string)
+        except UnicodeEncodeError:
+            safe_preview = email_string.encode("ascii", errors="ignore").decode(
+                "ascii", errors="ignore"
+            )
+            print(safe_preview)
 
     def run(self):
         close_games = ""
